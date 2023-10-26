@@ -238,6 +238,34 @@ def test(args, rank, world_size, loader, model, device):
 
     return test_acc, test_loss
 
+
+def c_test(args, rank, world_size, loader0, loader1, model0, model1, device):
+    loss_fn = torch.nn.CrossEntropyLoss()
+    ddp_loss = torch.zeros(3).to(device)
+    model0.eval()
+    model1.eval()
+    with torch.no_grad():
+        for batch, ((X0, y0), (X1, y1))  in enumerate(zip(iter(loader0), iter(loader1))):
+            X0, y0 = X0.to(device), y0.to(device)
+            X1, y1 = X1.to(device), y1.to(device)
+
+            output = torch.nn.Softmax(-1)(model0(X0)) * torch.nn.Softmax(-1)(model1(X1))
+
+            ddp_loss[1] += (output.argmax(1) == y1).type(torch.float).sum().item()
+            ddp_loss[2] += len(X0)
+    
+    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+
+    test_acc = ddp_loss[1] / ddp_loss[2] 
+    test_loss = ddp_loss[0] / ddp_loss[2]
+
+    if rank == 0:
+        print('Test error: \tAccuracy: {:.2f}% \tAverage loss: {:.6f}'
+              .format(100*test_acc, test_loss))
+
+    return test_acc
+
+
 def create_imagefolder(data, samples, path, transform, new_path=None):
     imgfolder = datasets.ImageFolder(path, transform=transform)
     imgfolder.class_to_idx = data['class_map']
