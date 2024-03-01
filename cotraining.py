@@ -47,6 +47,7 @@ def Atransforms_fn(img):
     return Atransforms(image=np.array(img))['image']
 
 
+
 def create_model(auto_wrap_policy, device, num_classes, random_state=None):
     if random_state is not None:
         torch.manual_seed(random_state)
@@ -69,18 +70,20 @@ def c_test(rank, model0, model1, loader0, loader1, device):
             X0, y0 = X0.to(device), y0.to(device)
             X1, y1 = X1.to(device), y1.to(device)
 
-            output = torch.nn.Softmax(-1)(model0(X0)) * torch.nn.Softmax(-1)(model1(X1))
+            output = torch.nn.Softmax(-1)(torch.clamp(model0(X0) + model1(X1), -2**14, 2**14))
 
-            ddp_loss[1] += (output.argmax(1) == y1).type(torch.float).sum().item()
+            ddp_loss[1] += (output.argmax(1) == y0).type(torch.float).sum().item()
             ddp_loss[2] += len(X0)
     
     dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
 
     test_acc = ddp_loss[1] / ddp_loss[2] 
 
+    print(f'ddp_loss1: {ddp_loss[1]}, ddp_loss2: {ddp_loss[2]}')
+
     if rank == 0:
         print('Test error: \tCo-Accuracy: {:.2f}%'
-              .format(100*test_acc))
+              .format(100 * test_acc))
 
     return test_acc
 
@@ -121,6 +124,8 @@ def training_process(args, rank, world_size):
 
     samples_unlbl[0] += data_u['labeled']
     samples_unlbl[1] += data_u['inferred']
+
+    assert len(samples_unlbl[0]) == len(samples_unlbl[1])
 
     # ResNet50 wants 224x224 images
 
@@ -168,7 +173,7 @@ def training_process(args, rank, world_size):
               'model1_state': models[1].state_dict()}
 
     ct_model = CoTrainingModel(rank, world_size, models)
-    ct_model.frequencies = counts / counts.sum()
+    ct_model.frequencies = counts
 
     if rank == 0:
        wandb.init(project='co-training-calibrate-jay',
@@ -181,8 +186,11 @@ def training_process(args, rank, world_size):
         print("Length of datasets:\n Train: {} \tUnlabeled: {} \tVal: {} \tTest: {}"
             .format(len(samples_train[0]), len(samples_unlbl[0]),
                     len(samples_val[0]), len(samples_test[0])))
-
-    loss_fn = nn.CrossEntropyLoss()
+    
+    weights=-1*torch.log(torch.nn.Softmax(-1)(torch.tensor(counts).type(torch.float32)))
+    # loss_fn = nn.CrossEntropyLoss()
+    
+    loss_fn = EDLLossMSE(3, weights=weights)
 
     # calibration metrics
     ece_criterion = metrics.ECELoss()
@@ -197,6 +205,7 @@ def training_process(args, rank, world_size):
     best_val_loss = float('inf')
     c_iter_logs = []
     for c_iter in range(args.cotrain_iters):
+        loss_fn = EDLLossMSE(3, weights=weights)
         if len(data_unlbl0) == 0 and len(data_unlbl1) == 0:
             break
         if args.from_scratch and c_iter > 0:
@@ -217,10 +226,10 @@ def training_process(args, rank, world_size):
                         'train_views': train_views,
                         'val_views': val_views,
                         'test_views': test_views,
-                        'batch_size': args.batch_size}
+                        'batch_size': args.batch_size,
+                        'test_batch_size': args.test_batch_size}
         
-        opt_kwargs = {'lr': args.learning_rate, 
-                            'momentum': args.momentum}
+        opt_kwargs = {'lr': args.learning_rate}
         
         stopper_kwargs = {'metric': args.stopping_metric,
                            'patience': args.patience,
@@ -233,10 +242,13 @@ def training_process(args, rank, world_size):
         best_val_acc = max(best_val_acc, best_val_acc_i)
         best_val_loss = min(best_val_loss, best_val_loss_i)
 
+        print('best val acc:', best_val_acc)
+
         # load best states for this iteration
         for i, model in enumerate(models):
             model.load_state_dict(states[f'model{i}_state'])
 
+        print(len(data_val0), len(data_val1))
         # no persistent workers as we're only iterating through it a few times from here
         sampler_val0, loader_val0 = create_sampler_loader(rank, world_size, data_val0, args.test_batch_size)
         sampler_test0, loader_test0 = create_sampler_loader(rank, world_size, data_test0, args.test_batch_size)
@@ -244,26 +256,18 @@ def training_process(args, rank, world_size):
         sampler_test1, loader_test1 = create_sampler_loader(rank, world_size, data_test1, args.test_batch_size)
         
         # co-training val/test accuracy
-        c_acc_val = c_test(rank, ct_model.models[0], ct_model.models[1], loader_val0, loader_val1, device)
-        c_acc_test = c_test(rank, ct_model.models[0], ct_model.models[1], loader_test0, loader_test1, device)
-        
-        if args.calibrate:
-            if rank == 0:
-                print("calibrating models...")
+        c_acc_val = c_test(rank, models[0], models[1], loader_val0, loader_val1, device)
+        c_acc_test = c_test(rank, models[0], models[1], loader_test0, loader_test1, device)
 
-            ct_model.models[0] = recalibration.ModelWithTemperature(ct_model.models[0])
-            ct_model.models[0].set_temperature(world_size, device, loader_val0, args.test_batch_size, num_classes)
-
-            ct_model.models[1] = recalibration.ModelWithTemperature(ct_model.models[1])
-            ct_model.models[1].set_temperature(world_size, device, loader_val1, args.test_batch_size, num_classes)
+        # prediction
+        preds_softmax, u, labels = ct_model.predict_uncertainty(device, unlbl_views, num_classes, args.batch_size)
 
         if rank == 0:
-            print("checking model calibration after temperature scaling...")
+            print("checking model calibration...")
 
         # calibration measurements
-        preds_softmax_val = ct_model.predict(device, val_views, num_classes, args.test_batch_size)
         calibration_logs = {}
-        for i, preds in enumerate(preds_softmax_val):
+        for i, preds in enumerate(preds_softmax):
             preds_np = preds.detach().cpu().numpy()
             lbls_np = labels.detach().cpu().numpy().astype(int)
             ece_loss = ece_criterion.loss(preds_np, lbls_np, logits=False)
@@ -272,19 +276,28 @@ def training_process(args, rank, world_size):
             calibration_logs.update({f'ece_loss{i}': ece_loss,
                                      f'ace_loss{i}': ace_loss,
                                      f'mace_loss{i}': mace_loss})
-        
-        # prediction
-        preds_softmax, labels = ct_model.predict(device, unlbl_views, num_classes, args.test_batch_size)
+            print({f'ece_loss{i}': ece_loss,
+                                     f'ace_loss{i}': ace_loss,
+                                     f'mace_loss{i}': mace_loss})
+        if rank == 0:
+            print("calibrating models...")
+
+        # TODO clean this a bit
+        #models[0] = recalibration.ModelWithTemperature(models[0])
+        #models[0].set_temperature(world_size, device, loader_val0, args.test_batch_size, num_classes)
+
+        #models[1] = recalibration.ModelWithTemperature(models[1])
+        #models[1].set_temperature(world_size, device, loader_val1, args.test_batch_size, num_classes)
 
         # update datasets
-        ct_model.update(preds_softmax, train_views, unlbl_views, k)
+        ct_model.update(preds_softmax, u, train_views, unlbl_views, k)
 
         if rank == 0:
             print("testing after dataset update and calibration...")
 
         # test individual models after co-training update and calibration
-        test_acc0, test_loss0 = test_ddp(rank, device, ct_model.models[0], loader_test0, loss_fn)
-        test_acc1, test_loss1 = test_ddp(rank, device, ct_model.models[1], loader_test1, loss_fn)
+        test_acc0, test_loss0 = test_ddp(rank, device, models[0], loader_test0, loss_fn)
+        test_acc1, test_loss1 = test_ddp(rank, device, models[1], loader_test1, loss_fn)
 
         c_log = {'test_acc0': test_acc0,
                  'test_loss0': test_loss0,
@@ -330,17 +343,17 @@ def main(args, rank, world_size):
 def create_parser():
     parser = argparse.ArgumentParser(description='co-training')
     
-    parser.add_argument('-e', '--epochs', type=int, default=100, 
+    parser.add_argument('-e', '--epochs', type=int, default=512, 
                         help='training epochs (default: %(default)s)')
-    parser.add_argument('-b', '--batch_size', type=int, default=64, 
+    parser.add_argument('-b', '--batch_size', type=int, default=256, 
                         help='batch size for training (default: %(default)s)')
-    parser.add_argument('-tb', '--test_batch_size', type=int, default=1024, 
+    parser.add_argument('-tb', '--test_batch_size', type=int, default=32, 
                         help=' batch size for testing (default: %(default)s)')
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-3,
                         help='learning rate for SGD (default: %(default)s)')
     parser.add_argument('-m', '--momentum', type=float, default=0.9,
                         help='momentum for SGD (default: %(default)s')
-    parser.add_argument('-p', '--patience', type=float, default=32,
+    parser.add_argument('-p', '--patience', type=float, default=64,
                         help='number of epochs to train for without improvement (default: %(default)s)')
     parser.add_argument('-md', '--min_delta', type=float, default=1e-3,
                         help='minimum delta for early stopping metric (default: %(default)s)')
@@ -348,8 +361,8 @@ def create_parser():
                         help='max number of iterations for co-training (default: %(default)s)')
     parser.add_argument('--k', type=float, default=[0.05],
                         help='percentage of unlabeled samples to bring in each \
-                            co-training iteration (default: 0.05)')
-    parser.add_argument('--percent_unlabeled', type=float, default=[0.95, 0.9, 0.85, 0.8, 0.75],
+                            co-training iteration (default: 0.025)')
+    parser.add_argument('--percent_unlabeled', type=float, default=[0.75, 0.9, 0.95],
                         help='percentage of unlabeled samples to start with (default: 0.9')
     parser.add_argument('--percent_test', type=float, default=0.2,
                         help='percentage of samples to use for testing (default: %(default)s)')
@@ -359,9 +372,7 @@ def create_parser():
                         help='metric to use for early stopping (default: %(default)s)')
     parser.add_argument('--from_scratch', action='store_true',
                         help='whether to train a new model every co-training iteration (default: False)')
-    parser.add_argument('--calibrate', action='store_true',
-                        help='whether to calibrate models before making predictions (default: False)')
-    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/jroth/co-training/co-training_fewshot/',
+    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/jroth/co-training/co-training_fewer/',
                         help='path for hparam search directory')
     parser.add_argument('--seed', type=int, default=13,
                         help='seed for random number generator (default: %(default)s)')

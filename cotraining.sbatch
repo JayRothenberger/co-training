@@ -5,7 +5,7 @@
 # Change the email address to yours! (I don’t want email about your experiments)
 # Change the chdir line to match the location of where your code is located
 #
-#SBATCH --partition=ai2es
+#SBATCH --partition=disc
 #SBATCH --cpus-per-task=64
 # The number of cores you get
 #SBATCH --ntasks=1
@@ -15,7 +15,7 @@
 # The %04a is translated into a 4-digit number that encodes the SLURM_ARRAY_TASK_ID
 #SBATCH --output=/ourdisk/hpc/ai2es/jroth/out.txt
 #SBATCH --error=/ourdisk/hpc/ai2es/jroth/err.txt
-#SBATCH --time=01:30:00
+#SBATCH --time=09:30:00
 #SBATCH --job-name=cotraining
 #SBATCH --mail-user=jay.c.rothenberger@ou.edu
 #SBATCH --mail-type=ALL

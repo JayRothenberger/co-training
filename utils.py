@@ -64,17 +64,42 @@ def create_sampler_loader(rank: int,
                                                'shuffle': False}, 
                           shuffle=True,
                           persistent_workers=False):
+    
     sampler = DistributedSampler(data, rank=rank, num_replicas=world_size, shuffle=shuffle)
 
     loader_kwargs = {'batch_size': batch_size, 
                      'sampler': sampler, 
                      'multiprocessing_context': 'forkserver', 
-                     'persistent_workers': persistent_workers}
+                     'persistent_workers': persistent_workers,
+                     'drop_last': False}
+    
     loader_kwargs.update(cuda_kwargs)
 
     loader = DataLoader(data, **loader_kwargs)
 
     return sampler, loader
+
+
+def create_loader(rank: int, 
+                          world_size: int, 
+                          data: torch.utils.data.Dataset,
+                          batch_size: int = 64,
+                          cuda_kwargs: dict = {'num_workers': 12, 
+                                               'pin_memory': True, 
+                                               'shuffle': False}, 
+                          shuffle=True,
+                          persistent_workers=False):
+
+    loader_kwargs = {'batch_size': batch_size, 
+                     'multiprocessing_context': 'forkserver', 
+                     'persistent_workers': persistent_workers,
+                     'drop_last': False}
+    
+    loader_kwargs.update(cuda_kwargs)
+
+    loader = DataLoader(data, **loader_kwargs)
+
+    return loader
 
 
 def create_samplers_loaders(rank: int, 
@@ -373,3 +398,164 @@ def save_reliability_diagram(view_num: int,
     plt_test.savefig(f'plots/unlbl{percent_unlabeled}_view{view_num}_iter{iteration}.png',
                      bbox_inches='tight')
 
+
+# https://github.com/ai2es/miles-guess/blob/main/mlguess/torch/class_losses.py
+import torch.nn.functional as F
+import torch
+
+
+
+"""
+
+    Categorical losses and utilities
+
+"""
+
+def get_device():
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+    return device
+
+
+def relu_evidence(y):
+    return F.relu(y)
+
+
+def exp_evidence(y):
+    return torch.exp(torch.clamp(y, -10, 10))
+
+
+def softplus_evidence(y):
+    return F.softplus(y)
+
+
+def kl_divergence(alpha, num_classes, device=None):
+    if not device:
+        device = get_device()
+    ones = torch.ones([1, num_classes], dtype=torch.float32, device=device)
+    sum_alpha = torch.sum(alpha, dim=1, keepdim=True)
+    first_term = (
+        torch.lgamma(sum_alpha)
+        - torch.lgamma(alpha).sum(dim=1, keepdim=True)
+        + torch.lgamma(ones).sum(dim=1, keepdim=True)
+        - torch.lgamma(ones.sum(dim=1, keepdim=True))
+    )
+    second_term = (
+        (alpha - ones)
+        .mul(torch.digamma(alpha) - torch.digamma(sum_alpha))
+        .sum(dim=1, keepdim=True)
+    )
+    kl = first_term + second_term
+    return kl
+
+
+def loglikelihood_loss(y, alpha, device=None):
+    if not device:
+        device = get_device()
+    y = y.to(device)
+    alpha = alpha.to(device)
+    S = torch.sum(alpha, dim=1, keepdim=True)
+    loglikelihood_err = torch.sum((y - (alpha / S)) ** 2, dim=1, keepdim=True)
+    loglikelihood_var = torch.sum(
+        alpha * (S - alpha) / (S * S * (S + 1)), dim=1, keepdim=True
+    )
+    loglikelihood = loglikelihood_err + loglikelihood_var
+    return loglikelihood
+
+
+def mse_loss(y, alpha, epoch_num, num_classes, annealing_step, weights=None, device=None):
+    if not device:
+        device = get_device()
+    y = y.to(device)
+    alpha = alpha.to(device)
+
+    if isinstance(weights, torch.Tensor):
+        weights = weights.to(device)
+        loglikelihood = (weights * y).sum(-1) * loglikelihood_loss(y, alpha, device=device)
+    else:
+        loglikelihood = loglikelihood_loss(y, alpha, device=device)
+
+    annealing_coef = torch.min(
+        torch.tensor(1.0, dtype=torch.float32),
+        torch.tensor(epoch_num / annealing_step, dtype=torch.float32),
+    )
+
+    kl_alpha = (alpha - 1) * (1 - y) + 1
+    kl_div = annealing_coef * kl_divergence(kl_alpha, num_classes, device=device)
+    return loglikelihood + kl_div
+
+
+def edl_loss(func, y, alpha, epoch_num, num_classes, annealing_step, weights=None, device=None):
+    y = y.to(device)
+    alpha = alpha.to(device)
+    S = torch.sum(alpha, dim=1, keepdim=True)
+    if not isinstance(weights, torch.Tensor):
+        A = torch.sum(y * (func(S) - func(alpha)), dim=1, keepdim=True)
+    else:
+        weights = weights.to(device)
+        A = torch.sum((weights * y).sum(-1) * (func(S) - func(alpha)), dim=1, keepdim=True)
+
+    annealing_coef = torch.min(
+        torch.tensor(1.0, dtype=torch.float32),
+        torch.tensor(epoch_num / annealing_step, dtype=torch.float32),
+    )
+
+    kl_alpha = (alpha - 1) * (1 - y) + 1
+    kl_div = annealing_coef * kl_divergence(kl_alpha, num_classes, device=device)
+    return A + kl_div
+
+def edl_mse_loss(output, target, epoch_num, num_classes, annealing_step, weights=None, device=None):
+    if device is None:
+        device = get_device()
+    evidence = relu_evidence(output)
+    alpha = evidence + 1
+
+    loss = torch.mean(
+        mse_loss(target, alpha, epoch_num, num_classes, annealing_step, device)
+    )
+    return loss
+
+
+def edl_digamma_loss(
+    output, target, epoch_num, num_classes, annealing_step, weights=None, device=None
+):
+    if not device:
+        device = get_device()
+    evidence = relu_evidence(output)
+    alpha = evidence + 1
+    
+    loss = torch.mean(
+        edl_loss(
+            torch.digamma, target, alpha, epoch_num, num_classes, annealing_step, weights, device
+        )
+    )
+    return loss
+
+def edl_log_loss(output, target, epoch_num, num_classes, annealing_step, weights=None, device=None):
+    if not device:
+        device = get_device()
+    evidence = relu_evidence(output)
+    alpha = evidence + 1
+    loss = torch.mean(
+        edl_loss(
+            torch.log, target, alpha, epoch_num, num_classes, annealing_step, weights, device
+        )
+    )
+    return loss
+
+class EDLLossMSE:
+    def __init__(self, num_classes, weights=None):
+        self.epoch_num = 1
+        self.annealing_step = 100
+        self.num_classes = num_classes
+        self.weights = weights
+        self.CE = torch.nn.CrossEntropyLoss(weight=weights.to(get_device()).type(torch.float32))
+
+    def __call__(self, output, target):
+        return edl_mse_loss(output, F.one_hot(target, self.num_classes), self.epoch_num, self.num_classes, self.annealing_step, weights=self.weights) + self.CE(output, target)
+
+    def step_epoch(self):
+        self.epoch_num += 1
+
+    def step_annealing(self):
+        self.annealing_step *= 1.01

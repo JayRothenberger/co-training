@@ -4,8 +4,9 @@ import numpy as np
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.optim import SGD
+from torch.optim import Adam
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+from copy import deepcopy as copy
 
 from utils import *
 
@@ -58,17 +59,20 @@ def test_ddp(rank, device, model, loader, loss_fn):
     return test_acc, test_loss
 
 
-def predict_ddp(world_size, device, model, loader, batch_size, num_classes):
+def predict_ddp(world_size, device, model, loader, batch_size, num_classes, softmax_logits=True):
     model.eval()
     predictions = []
     labels = []
     softmax = torch.nn.Softmax(-1)
     with torch.no_grad():
         for X, y in loader:
-            tensor_list = [torch.full((batch_size, num_classes), -1,
+            tensor_list = [torch.full((batch_size, num_classes), -99,
                                       dtype=torch.float16).to(device) 
                            for _ in range(world_size)]
-            output = softmax(model(X.to(device)))
+            if softmax_logits:
+                output = softmax(model(X.to(device)))
+            else:
+                output = model(X.to(device))
 
             # pad the output so that it contains the same 
             # number of rows as specified by the batch size
@@ -95,7 +99,9 @@ def predict_ddp(world_size, device, model, loader, batch_size, num_classes):
 
             # remove all rows of the tensor that contain a -1
             # (as this is not a valid value anywhere)
-            mask = ~(batch_outputs == -1).any(-1)
+            mask = ~(batch_outputs == -99).any(-1)
+            if mask.shape[0] < batch_size:
+                print(mask)
             batch_outputs = batch_outputs[mask]
             predictions.append(batch_outputs)
 
@@ -148,8 +154,9 @@ def c_test(rank, model0, model1, loader0, loader1, device):
     return test_acc
 
 
-def get_topk(prediction, k, frequencies):
+def get_topk(prediction, u, k, frequencies):
     prob, label = torch.max(prediction, 1)
+
 
     unique, counts = np.unique(label.cpu().numpy(), return_counts=True)
 
@@ -158,11 +165,15 @@ def get_topk(prediction, k, frequencies):
     count_per_class = k * (np.ones_like(frequencies) / frequencies.shape[0])
     # ok, but this is not exactly n% we will have some rounding to do here
     idx = []
-    while len(idx) < k:
-        idx = torch.cat([torch.argsort(prob[torch.where(label == l)], descending=True)[:cascade_round(count_per_class)[l]] for l in unique])
+    u = u.squeeze()
+    print('u shape', u.shape)
+
+    while len(idx) <= k:
+        idx = torch.cat([torch.argsort(u[torch.where(label == l)], descending=True)[:cascade_round(count_per_class)[l]] for l in unique])
         count_per_class += (1 / frequencies.shape[0])
 
-    assert len(idx) == k
+    idx = idx[:k]
+    print('idx shape', idx.shape)
 
     unique, counts = np.unique(label[idx].cpu().numpy(), return_counts=True)
     print(counts, frequencies)
@@ -180,7 +191,7 @@ def merge_wandb_logs(iteration, epochs, wandb_logs) -> list:
         for log in logs:
             if log is None: log = {}
             log_merged = log_merged | log
-        step = epoch + iteration*epochs
+        step = epoch + iteration * epochs
         logs_with_steps.append((log_merged, step))
     return logs_with_steps
 
@@ -196,7 +207,7 @@ class CoTrainingModel:
         self.logs = []
         self.frequencies = np.array([])
 
-    def predict(self, device, unlbl_views, num_classes, batch_size):
+    def predict(self, device, unlbl_views, num_classes, batch_size, softmax_logits=True):
         samplers_unlbl = []
         loaders_unlbl = []
         for i in range(len(unlbl_views)):
@@ -217,7 +228,8 @@ class CoTrainingModel:
             preds, labels = predict_ddp(self.world_size, device, 
                                model, loaders_unlbl[i], 
                                batch_size, 
-                               num_classes)
+                               num_classes, 
+                               softmax_logits=softmax_logits)
             preds = preds[:len(unlbl_views[i])]
             labels = labels[:(len(unlbl_views[i]))]
             # ensure all processes agree on the list of predictions
@@ -233,8 +245,29 @@ class CoTrainingModel:
 
         return preds_softmax, labels
 
+    def predict_uncertainty(self, device, unlbl_views, num_classes, batch_size):
+
+        preds_softmax, labels = self.predict(device, unlbl_views, num_classes, batch_size, softmax_logits=False)
+        
+        us = []
+        for i, preds in enumerate(preds_softmax):
+            # dempster-shafer theory
+            evidence = relu_evidence(preds) # can also try softplus and exp evidence schemes
+            alpha = evidence + 1
+            S = torch.sum(alpha, dim=1, keepdim=True)
+            # TODO: 3 = num classes
+            u = num_classes / S
+            prob = alpha / S
+            
+            # law of total uncertainty 
+            epistemic = prob * (1 - prob) / (S + 1)
+            aleatoric = prob - prob**2 - epistemic
+            us.append(u)
+        return preds_softmax, us, labels
+
     def update(self,
                preds_softmax: torch.Tensor,
+               u: list,
                train_views: list, 
                unlbl_views: list,
                k_total: float) -> None:
@@ -256,8 +289,9 @@ class CoTrainingModel:
         if len(self.models) == 2:
             lbls_topk = []
             idxes_topk = []
-            for pred in preds_softmax:
+            for idz, pred in enumerate(preds_softmax):
                 _, lbl_topk, idx_topk = get_topk(pred,
+                                                 u[idz],
                                                  k_model if k_model <= len(pred)
                                                  else len(pred), self.frequencies)
                 lbls_topk.append(lbl_topk.detach().cpu().numpy())
@@ -321,6 +355,13 @@ class CoTrainingModel:
                                             train_views[0])
         train_views[1] = add_to_imagefolder(paths1, lbls_topk[0].tolist(), 
                                             train_views[1])
+        
+        unique, counts = np.unique(np.array([y for (x, y) in train_views[0].samples]), return_counts=True)
+        print(unique, counts)
+        self.frequencies += counts
+        unique, counts = np.unique(np.array([y for (x, y) in train_views[1].samples]), return_counts=True)
+        print(unique, counts)
+        self.frequencies += counts
 
         # remove instances from unlabeled dataset
         mask = np.ones(len(unlbl_views[0]), dtype=bool)
@@ -392,7 +433,8 @@ class CoTrainingModel:
               val_views: list,
               test_views: list,
               batch_size: int = 64,
-              optimizer: torch.optim.Optimizer = SGD,
+              test_batch_size: int = 64,
+              optimizer: torch.optim.Optimizer = Adam,
               optimizer_kwargs: dict = {'lr':1e-3,
                                         'momentum': 0.9},
               stopper_kwargs: dict = {'metric': 'accuracy',
@@ -425,19 +467,23 @@ class CoTrainingModel:
                                                                 persistent_workers=True)
         
         samplers_val, loaders_val = create_samplers_loaders(self.rank, self.world_size,
-                                                            val_views, batch_size, 
+                                                            val_views, test_batch_size, 
                                                             persistent_workers=True)
         
         samplers_test, loaders_test = create_samplers_loaders(self.rank, self.world_size,
-                                                              test_views, batch_size, 
+                                                              test_views, test_batch_size, 
                                                               persistent_workers=True)
 
-        loss_fn = nn.CrossEntropyLoss(weight=(-1*torch.log(torch.tensor(self.frequencies))))
+        # loss_fn = nn.CrossEntropyLoss()
 
         best_val_acc = 0.0
         best_val_loss = float('inf')
         iteration_logs = []
         for i in range(len(self.models)):
+            best_val_acc = 0.0
+            best_val_loss = float('inf')
+            weights=-1*torch.log(torch.tensor(self.frequencies / (self.frequencies.sum() * 2)))
+            loss_fn = EDLLossMSE(3, weights=weights)
             if self.rank == 0:
                 print(f"training view{i}...")
             step = 0 * iteration
@@ -455,10 +501,11 @@ class CoTrainingModel:
 
                 stoppers[i].step(val_acc, val_loss)
                 if stoppers[i].epochs_since_improvement == 0:
-                    states[f'model{i}_state'] = self.models[i].state_dict()
+                    states[f'model{i}_state'] = copy(self.models[i].state_dict())
                     states[f'optimizer{i}_state'] = optimizers[i].state_dict()
                     best_val_acc = max(best_val_acc, stoppers[i].best_val_acc)
                     best_val_loss = min(best_val_loss, stoppers[i].best_val_loss)
+                    print('best val acc', best_val_acc)
                 
                 model_logs.append({f'train_acc{i}': train_acc,
                                   f'train_loss{i}': train_loss,
@@ -474,6 +521,8 @@ class CoTrainingModel:
                     break
                 
                 schedulers[i].step(val_loss)
+                loss_fn.step_epoch()
+                loss_fn.step_annealing()
 
             # need to manually shut down the workers as they will persist otherwise
             loaders_train[i]._iterator._shutdown_workers()
@@ -481,6 +530,7 @@ class CoTrainingModel:
             loaders_test[i]._iterator._shutdown_workers()
 
             iteration_logs.append(model_logs)
+
 
         self.logs += merge_wandb_logs(iteration, epochs, iteration_logs)
     
