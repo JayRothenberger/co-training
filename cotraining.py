@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 import torch.nn as nn
 import torch.optim as optim
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.wrap import (enable_wrap,
                                          size_based_auto_wrap_policy, wrap)
@@ -52,11 +53,9 @@ def create_model(auto_wrap_policy, device, num_classes, random_state=None):
     if random_state is not None:
         torch.manual_seed(random_state)
 
-    model = resnet50(num_classes=num_classes).to(device)
+    model = dino_RFGP(num_classes=num_classes).to(device)
     
-    model = FSDP(model, 
-                 auto_wrap_policy=auto_wrap_policy,
-                )
+    model = DDP(model, device_ids=[device], find_unused_parameters=True)
 
     return model
 
@@ -122,8 +121,8 @@ def training_process(args, rank, world_size):
         #im = Image.open(i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
         #im.save(i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
 
-    samples_unlbl[0] += data_u['labeled']
-    samples_unlbl[1] += data_u['inferred']
+    samples_unlbl[0] #+= data_u['labeled']
+    samples_unlbl[1] #+= data_u['inferred']
 
     assert len(samples_unlbl[0]) == len(samples_unlbl[1])
 
@@ -176,7 +175,7 @@ def training_process(args, rank, world_size):
     ct_model.frequencies = counts
 
     if rank == 0:
-       wandb.init(project='co-training-calibrate-jay',
+       wandb.init(project='co-training-sngp',
                    entity='ai2es',
                    name=f'Co-Training',
                    config={'args': vars(args)})
@@ -241,6 +240,8 @@ def training_process(args, rank, world_size):
         # update best val_acc
         best_val_acc = max(best_val_acc, best_val_acc_i)
         best_val_loss = min(best_val_loss, best_val_loss_i)
+        ct_model.epsilon = min(max(1.0 - best_val_acc, 0.2), ct_model.epsilon)
+        print('epsilon', ct_model.epsilon)
 
         print('best val acc:', best_val_acc)
 
@@ -343,7 +344,7 @@ def main(args, rank, world_size):
 def create_parser():
     parser = argparse.ArgumentParser(description='co-training')
     
-    parser.add_argument('-e', '--epochs', type=int, default=512, 
+    parser.add_argument('-e', '--epochs', type=int, default=25, 
                         help='training epochs (default: %(default)s)')
     parser.add_argument('-b', '--batch_size', type=int, default=256, 
                         help='batch size for training (default: %(default)s)')
@@ -359,10 +360,10 @@ def create_parser():
                         help='minimum delta for early stopping metric (default: %(default)s)')
     parser.add_argument('--cotrain_iters', type=int, default=100,
                         help='max number of iterations for co-training (default: %(default)s)')
-    parser.add_argument('--k', type=float, default=[0.05],
+    parser.add_argument('--k', type=float, default=[0.01],
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.025)')
-    parser.add_argument('--percent_unlabeled', type=float, default=[0.75, 0.9, 0.95],
+    parser.add_argument('--percent_unlabeled', type=float, default=[0.75, 0.8, 0.85, 0.9, 0.95] * 3,
                         help='percentage of unlabeled samples to start with (default: 0.9')
     parser.add_argument('--percent_test', type=float, default=0.2,
                         help='percentage of samples to use for testing (default: %(default)s)')
@@ -372,7 +373,7 @@ def create_parser():
                         help='metric to use for early stopping (default: %(default)s)')
     parser.add_argument('--from_scratch', action='store_true',
                         help='whether to train a new model every co-training iteration (default: False)')
-    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/jroth/co-training/co-training_fewer/',
+    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/jroth/co-training/co-training_fewer_sngp_2/',
                         help='path for hparam search directory')
     parser.add_argument('--seed', type=int, default=13,
                         help='seed for random number generator (default: %(default)s)')

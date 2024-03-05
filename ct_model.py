@@ -157,28 +157,73 @@ def c_test(rank, model0, model1, loader0, loader1, device):
 def get_topk(prediction, u, k, frequencies):
     prob, label = torch.max(prediction, 1)
 
+    unique, counts = np.unique(label.cpu().numpy(), return_counts=True)
+
+    idx = [[] for l in unique]
+    u = u.squeeze()
+
+    hist, edges = np.histogram(u.clone().cpu().numpy())
+    print(hist, edges)
+
+    dec_conf = torch.argsort(u, descending=False)
+    # ascending uncertainty
+    for i in dec_conf:
+        for unq, l in enumerate(unique):
+            # append the label to the appropriate list (could skip this for if label == idx)
+            if label[i] == l:
+                idx[unq].append(i)
+                
+    idx = [torch.tensor(inds) for inds in idx]
+    # stratified balance
+    ratios = (frequencies / frequencies.sum())
+    # the percent of observations we can use for each class
+    count_per_class = ratios * k
+    
+    idxs = []
+    print(f'gathering k... {k}')
+    while len(idxs) <= k:
+        idxs = torch.cat([idx[l][:cascade_round(count_per_class)[l]] for l in range(len(unique))])
+        count_per_class += (1 / frequencies.shape[0])
+
+    idxs = idxs[:k]
+    print('idx shape', idxs.shape)
+
+    unique, counts = np.unique(label[idxs].cpu().numpy(), return_counts=True)
+    print(counts, frequencies)
+
+    return prob[idxs], label[idxs], idxs
+
+
+def get_k(prediction, u, epsilon, frequencies):
+    prob, label = torch.max(prediction, 1)
+
 
     unique, counts = np.unique(label.cpu().numpy(), return_counts=True)
 
-    counts = frequencies
-
-    count_per_class = k * (np.ones_like(frequencies) / frequencies.shape[0])
     # ok, but this is not exactly n% we will have some rounding to do here
-    idx = []
+    idx = [[] for l in unique]
     u = u.squeeze()
+
     print('u shape', u.shape)
 
-    while len(idx) <= k:
-        idx = torch.cat([torch.argsort(u[torch.where(label == l)], descending=True)[:cascade_round(count_per_class)[l]] for l in unique])
-        count_per_class += (1 / frequencies.shape[0])
-
-    idx = idx[:k]
-    print('idx shape', idx.shape)
-
-    unique, counts = np.unique(label[idx].cpu().numpy(), return_counts=True)
-    print(counts, frequencies)
-
-    return prob[idx], label[idx], idx
+    dec_conf = torch.argsort(u, descending=False)
+    # ascending uncertainty
+    for i in dec_conf:
+        # for each label
+        if u[i] > epsilon:
+            break
+        for unq, l in enumerate(unique):
+            # append the label to the appropriate list (could skip this for if label == idx)
+            if label[i] == l:
+                idx[unq].append(i)
+                
+    idx = [torch.tensor(inds) for inds in idx]
+    # stratified balance
+    ratios = (frequencies / frequencies.sum())
+    # normalize by the balance
+    k = int((torch.tensor([inds.shape[0] for inds in idx]) / ratios).min())
+    
+    return k
 
 
 # some models may end training earlier than others,
@@ -206,8 +251,9 @@ class CoTrainingModel:
         self.models = models
         self.logs = []
         self.frequencies = np.array([])
+        self.epsilon = 1.0
 
-    def predict(self, device, unlbl_views, num_classes, batch_size, softmax_logits=True):
+    def predict(self, device, unlbl_views, num_classes, batch_size, softmax_logits=False):
         samplers_unlbl = []
         loaders_unlbl = []
         for i in range(len(unlbl_views)):
@@ -247,22 +293,13 @@ class CoTrainingModel:
 
     def predict_uncertainty(self, device, unlbl_views, num_classes, batch_size):
 
-        preds_softmax, labels = self.predict(device, unlbl_views, num_classes, batch_size, softmax_logits=False)
+        preds_softmax, labels = self.predict(device, unlbl_views, num_classes, batch_size, softmax_logits=True)
         
         us = []
-        for i, preds in enumerate(preds_softmax):
-            # dempster-shafer theory
-            evidence = relu_evidence(preds) # can also try softplus and exp evidence schemes
-            alpha = evidence + 1
-            S = torch.sum(alpha, dim=1, keepdim=True)
-            # TODO: 3 = num classes
-            u = num_classes / S
-            prob = alpha / S
-            
-            # law of total uncertainty 
-            epistemic = prob * (1 - prob) / (S + 1)
-            aleatoric = prob - prob**2 - epistemic
-            us.append(u)
+        for view, model in zip(unlbl_views, self.models):
+            model.module.update_covariance()
+            us.append(get_uncertainty(view, model, batch_size=256, verbose=True))
+
         return preds_softmax, us, labels
 
     def update(self,
@@ -279,8 +316,6 @@ class CoTrainingModel:
         # assuming that k is # of total dataset to bring in
         # we'll have each model take in top-(k // len(models)) predictions
         # (though we may bring in less than this.) (?)
-        k_model = k_total // len(self.models)
-
         if self.rank == 0:
             print("updating datasets...")
 
@@ -289,11 +324,21 @@ class CoTrainingModel:
         if len(self.models) == 2:
             lbls_topk = []
             idxes_topk = []
+            ks = []
+
+            for idz, pred, in enumerate(preds_softmax):
+                k = get_k(pred,
+                        u[idz],
+                        self.epsilon,
+                        self.frequencies)
+                ks.append(k)
+            k = min(ks)
+            print(k)
             for idz, pred in enumerate(preds_softmax):
                 _, lbl_topk, idx_topk = get_topk(pred,
                                                  u[idz],
-                                                 k_model if k_model <= len(pred)
-                                                 else len(pred), self.frequencies)
+                                                 k if k <= len(pred) else len(pred),
+                                                 self.frequencies)
                 lbls_topk.append(lbl_topk.detach().cpu().numpy())
                 idxes_topk.append(idx_topk.detach().cpu().numpy())
 

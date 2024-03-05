@@ -20,6 +20,7 @@
 #SBATCH --mail-user=jay.c.rothenberger@ou.edu
 #SBATCH --mail-type=ALL
 #SBATCH --chdir=/ourdisk/hpc/ai2es/jroth/co-training/
+#SBATCH --array=[0-4]%1
 #
 #################################################
 # Do not change this line unless you have your own python/tensorflow/keras set up

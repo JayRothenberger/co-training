@@ -107,7 +107,7 @@ class ModelWithTemperature(nn.Module):
 
         # Calculate NLL and ECE before temperature scaling
         before_temperature_nll = nll_criterion(logits.type(torch.float64), labels.type(torch.int64)).item()
-        before_temperature_ece = ece_criterion.loss(logits_np,labels_np, 15)
+        before_temperature_ece = ece_criterion.loss(logits_np, labels_np, 25)
         #before_temperature_ece = ece_criterion(logits, labels).item()
         #ece_2 = ece_criterion_2.loss(logits,labels)
         print('Before temperature - NLL: %.3f, ECE: %.3f' % (before_temperature_nll, before_temperature_ece))
@@ -124,7 +124,7 @@ class ModelWithTemperature(nn.Module):
 
         # Calculate NLL and ECE after temperature scaling
         after_temperature_nll = nll_criterion(self.temperature_scale(logits).type(torch.float64), labels.type(torch.int64)).item()
-        after_temperature_ece = ece_criterion.loss(self.temperature_scale(logits).detach().cpu().numpy(),labels.cpu().numpy(),15)
+        after_temperature_ece = ece_criterion.loss(self.temperature_scale(logits).detach().cpu().numpy(),labels.cpu().numpy(),25)
         #after_temperature_ece = ece_criterion(self.temperature_scale(logits), labels).item()
         print('Optimal temperature: %.3f' % self.temperature.item())
         print('After temperature - NLL: %.3f, ECE: %.3f' % (after_temperature_nll, after_temperature_ece))
