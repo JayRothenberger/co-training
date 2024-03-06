@@ -2,9 +2,11 @@ import argparse
 import functools
 import gc
 import os
+import shutil
 import pickle
 import random
 from math import floor
+import time
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 
@@ -105,24 +107,49 @@ def training_process(args, rank, world_size):
                                                                               args.k,
                                                                               random_state=args.seed)
     
-    unique, counts = np.unique(np.array([y for (x, y) in samples_train[0]]), return_counts=True)
+    unique, counts = np.unique(np.array([y for (x, y) in samples_train[0] + samples_val[0]]), return_counts=True)
 
     with open('/ourdisk/hpc/ai2es/jroth/unlabeled_samples_lists.pkl', 'rb') as fp:
         data_u = pickle.load(fp)
 
 
+    if rank == 0:
+        os.mkdir(os.environ['LSCRATCH'] + '/data')
+        shutil.copytree('/ourdisk/hpc/ai2es/jroth/data/labeled', os.environ['LSCRATCH'] + '/data/labeled')
+        shutil.copy('/ourdisk/hpc/ai2es/jroth/data/NYSDOT_m4er5dez4ab.tar.gz', os.environ['LSCRATCH'] + '/data/NYSDOT_m4er5dez4ab.tar.gz')
+        shutil.copy('/ourdisk/hpc/ai2es/jroth/data/Skyline_6464.tar.gz', os.environ['LSCRATCH'] + '/data/Skyline_6464.tar.gz')
+        print('copied')
+        os.system(f"tar -xzf {os.environ['LSCRATCH'] + '/data/NYSDOT_m4er5dez4ab.tar.gz'} -C {os.environ['LSCRATCH'] + '/data/'}")
+        os.system(f"tar -xzf {os.environ['LSCRATCH'] + '/data/Skyline_6464.tar.gz'} -C {os.environ['LSCRATCH'] + '/data/'}")
+        print('extracted')
+        os.system("touch done.txt")
+    else:
+        while not os.path.isfile("done.txt"):
+            time.sleep(10)
+    # shutil.copy(Skyline_6464.tar.gz)
+
+    for k, s in enumerate(samples_train):
+        scratch = os.environ['LSCRATCH'] + '/'
+        for i, (x, y) in enumerate(s):
+            s[i] = (x.replace('/ourdisk/hpc/ai2es/jroth/', os.environ['LSCRATCH'] + '/'), y)
+        samples_train[k] = s
+
     for j, (l, i) in enumerate(zip(data_u['labeled'], data_u['inferred'])):
         print(j, end='\r')
-        data_u['labeled'][j] = (l[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'), l[1])
-        data_u['inferred'][j] = (i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'), i[1])
-
+        scratch = os.environ['LSCRATCH'] + '/'
+        # scratch = '/ourdisk/hpc/ai2es/jroth/'
+        # shutil.copy(l[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'), l[0].replace('./', scratch))
+        data_u['labeled'][j] = (l[0].replace('./', scratch), l[1])
+        # shutil.copy(i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'), i[0].replace('./', scratch))
+        data_u['inferred'][j] = (i[0].replace('./', scratch), i[1])
+        
         #im = Image.open(l[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
         #im.save(l[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
         #im = Image.open(i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
         #im.save(i[0].replace('./', '/ourdisk/hpc/ai2es/jroth/'))
 
-    samples_unlbl[0] #+= data_u['labeled']
-    samples_unlbl[1] #+= data_u['inferred']
+    samples_unlbl[0] += data_u['labeled']
+    samples_unlbl[1] += data_u['inferred']
 
     assert len(samples_unlbl[0]) == len(samples_unlbl[1])
 
@@ -240,7 +267,9 @@ def training_process(args, rank, world_size):
         # update best val_acc
         best_val_acc = max(best_val_acc, best_val_acc_i)
         best_val_loss = min(best_val_loss, best_val_loss_i)
-        ct_model.epsilon = min(max(1.0 - best_val_acc, 0.2), ct_model.epsilon)
+
+        ct_model.epsilon = 1 - max(ct_model.frequencies / ct_model.frequencies.sum()) #  + (1 / args.cotrain_iters)
+
         print('epsilon', ct_model.epsilon)
 
         print('best val acc:', best_val_acc)
@@ -344,7 +373,7 @@ def main(args, rank, world_size):
 def create_parser():
     parser = argparse.ArgumentParser(description='co-training')
     
-    parser.add_argument('-e', '--epochs', type=int, default=25, 
+    parser.add_argument('-e', '--epochs', type=int, default=512, 
                         help='training epochs (default: %(default)s)')
     parser.add_argument('-b', '--batch_size', type=int, default=256, 
                         help='batch size for training (default: %(default)s)')

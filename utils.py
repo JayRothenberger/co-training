@@ -651,7 +651,6 @@ class RandomFeatureGaussianProcess(nn.Module):
         update_precision: bool = False,
     ):
         features = self.rff(X).detach()
-        features = torch.nn.functional.normalize(features)
 
         if update_precision:
             self.update_precision_(features)
@@ -691,6 +690,11 @@ class RandomFeatureGaussianProcess(nn.Module):
     def update_precision(self, X: torch.Tensor):
         with torch.no_grad():
             features = self.rff(X)
+            
+            features_list = [torch.zeros_like(features) for i in range(int(os.environ['WORLD_SIZE']))]
+            torch.distributed.all_gather(features_list, features)
+            features = torch.cat(features_list)
+
             self.update_precision_(features)
 
     def update_covariance(self):
@@ -735,7 +739,8 @@ def get_uncertainty(ds, model, batch_size=1024, verbose=True):
 
 
 def dino_RFGP(num_classes=3):
-    m = torch.nn.Sequential(dino_model(), torch.nn.BatchNorm1d(384))
+    m = torch.nn.Sequential(dino_model(), torch.nn.BatchNorm1d(384)) # linear = torch.nn.Linear(384, num_classes)
+    
     linear = RandomFeatureGaussianProcess(
                     in_features=384,
                     out_features=num_classes,
@@ -748,3 +753,34 @@ def dino_RFGP(num_classes=3):
                 )
     
     return linear
+
+
+def remove_gaps(arr, remove=1):
+    # remove the largest gap between numerical values in a 1-d array towards the heavier side
+    s, _ = torch.sort(arr)
+    a1 = torch.cat(s, torch.zeros(1,))
+    a2 = torch.cat(torch.zeros(1,), s)
+    # each coordinate represents the distance between this coordinate and the next
+    gaps = (a2 - a1)[1:-1]
+    order = torch.argsort(gaps, descending=True)
+
+    for i in range(remove):
+        coord = order[i]
+        offset = gaps[coord]
+        if coord > a1.shape[0] // 2:
+            arr -= torch.where(arr > s[coord]).type(torch.float32) * offset
+        else:
+            arr += torch.where(arr < s[coord]).type(torch.float32) * offset
+
+    return arr
+
+
+class LinearProbe(torch.nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.m = dino_model()
+        self.linear = torch.nn.Linear(384, num_classes)
+    
+    def forward(self, x):
+        x = self.m(x).detach()
+        return self.linear(x)

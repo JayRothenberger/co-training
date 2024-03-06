@@ -17,7 +17,7 @@ def train_ddp(rank, device, epoch, model, loader, loss_fn, optimizer):
     for X, y in loader:
         X, y = X.to(device), y.to(device)
         optimizer.zero_grad()
-        output = model(X)
+        output = model(X, update_precision=True)
         loss = loss_fn(output, y)
         loss.backward()
         optimizer.step()
@@ -59,18 +59,23 @@ def test_ddp(rank, device, model, loader, loss_fn):
     return test_acc, test_loss
 
 
-def predict_ddp(world_size, device, model, loader, batch_size, num_classes, softmax_logits=True):
+def predict_ddp(world_size, device, model, loader, batch_size, num_classes, with_variance=False):
     model.eval()
     predictions = []
     labels = []
-    softmax = torch.nn.Softmax(-1)
+    variances = []
+
     with torch.no_grad():
         for X, y in loader:
             tensor_list = [torch.full((batch_size, num_classes), -99,
                                       dtype=torch.float16).to(device) 
                            for _ in range(world_size)]
-            if softmax_logits:
-                output = softmax(model(X.to(device)))
+            
+            var_list = [torch.full((batch_size,), -99,
+                                      dtype=torch.float32).to(device) 
+                           for _ in range(world_size)]
+            if with_variance:
+                output, variance = model(X.to(device), with_variance=True)
             else:
                 output = model(X.to(device))
 
@@ -89,6 +94,11 @@ def predict_ddp(world_size, device, model, loader, batch_size, num_classes, soft
                                dtype=torch.float16).to(device)
             pad2[:y.shape[0]] = y
 
+            if with_variance:
+                pad3 = torch.full((batch_size,), -1, 
+                                dtype=torch.float32).to(device)
+                pad3[:variance.shape[0]] = variance
+
             # all-gather the full list of predictions across all processes
             dist.all_gather(tensor_list, pad)
             batch_outputs = torch.cat(tensor_list)
@@ -96,6 +106,10 @@ def predict_ddp(world_size, device, model, loader, batch_size, num_classes, soft
             # all-gather the full list of labels
             dist.all_gather(label_list, pad2)
             batch_labels = torch.cat(label_list)
+
+            if with_variance:
+                dist.all_gather(var_list, pad3)
+                batch_variance = torch.cat(var_list)
 
             # remove all rows of the tensor that contain a -1
             # (as this is not a valid value anywhere)
@@ -108,7 +122,13 @@ def predict_ddp(world_size, device, model, loader, batch_size, num_classes, soft
             batch_labels = batch_labels[mask]
             labels.append(batch_labels)
 
-    return torch.cat(predictions), torch.cat(labels)
+            if with_variance:
+                batch_variance = batch_variance[mask]
+                variances.append(batch_variance)
+    if with_variance:
+        return torch.cat(predictions), torch.cat(labels), torch.cat(variances)
+    else:
+        return torch.cat(predictions), torch.cat(labels)
 
 
 # def co_test_ddp(rank, device, models, loaders):
@@ -161,6 +181,7 @@ def get_topk(prediction, u, k, frequencies):
 
     idx = [[] for l in unique]
     u = u.squeeze()
+    print('u', u)
 
     hist, edges = np.histogram(u.clone().cpu().numpy())
     print(hist, edges)
@@ -174,6 +195,7 @@ def get_topk(prediction, u, k, frequencies):
                 idx[unq].append(i)
                 
     idx = [torch.tensor(inds) for inds in idx]
+    
     # stratified balance
     ratios = (frequencies / frequencies.sum())
     # the percent of observations we can use for each class
@@ -203,6 +225,7 @@ def get_k(prediction, u, epsilon, frequencies):
     # ok, but this is not exactly n% we will have some rounding to do here
     idx = [[] for l in unique]
     u = u.squeeze()
+    print(u.min(), u.max())
 
     print('u shape', u.shape)
 
@@ -218,11 +241,12 @@ def get_k(prediction, u, epsilon, frequencies):
                 idx[unq].append(i)
                 
     idx = [torch.tensor(inds) for inds in idx]
+    print(torch.tensor([inds.shape[0] for inds in idx]))
     # stratified balance
     ratios = (frequencies / frequencies.sum())
     # normalize by the balance
     k = int((torch.tensor([inds.shape[0] for inds in idx]) / ratios).min())
-    
+    print('k', k)
     return k
 
 
@@ -293,14 +317,52 @@ class CoTrainingModel:
 
     def predict_uncertainty(self, device, unlbl_views, num_classes, batch_size):
 
-        preds_softmax, labels = self.predict(device, unlbl_views, num_classes, batch_size, softmax_logits=True)
-        
-        us = []
-        for view, model in zip(unlbl_views, self.models):
-            model.module.update_covariance()
-            us.append(get_uncertainty(view, model, batch_size=256, verbose=True))
+        samplers_unlbl = []
+        loaders_unlbl = []
+        for i in range(len(unlbl_views)):
+            sampler_unlbl, loader_unlbl = create_sampler_loader(self.rank, 
+                                                                self.world_size,
+                                                                unlbl_views[i],
+                                                                batch_size,
+                                                                shuffle=False)
+            samplers_unlbl.append(sampler_unlbl)
+            loaders_unlbl.append(loader_unlbl)
 
-        return preds_softmax, us, labels
+        us = []
+        preds = []
+        labels = []
+
+        for model, loader in zip(self.models, loaders_unlbl):
+            preds_softmax, labels, uncs = predict_ddp(int(os.environ['WORLD_SIZE']),
+                                                            device, 
+                                                            model, 
+                                                            loader, 
+                                                            batch_size, 
+                                                            num_classes, 
+                                                            with_variance=True)
+            uncs.type(torch.float32)
+
+            #std = torch.std(uncs)
+            #mean = torch.mean(uncs)
+
+            #minval = torch.argsort(uncs)[500]
+            
+            # lean 6 sigma - we can clearly clamp out these outliers
+            #uncs = torch.clamp(uncs, max((mean - math.e*std), minval), (mean +  math.e*2*std))
+            uncs = remove_gaps(uncs, 5)
+            uncs = uncs - uncs.min()
+            uncs = torch.nn.ReLU()(uncs)
+            print(uncs.min(), uncs.max())
+            uncs = (uncs / uncs.max()) ** (1 / math.e)
+            print(uncs.shape)
+            us.append(uncs)
+            preds.append(preds_softmax)
+            
+        #for view, model in zip(unlbl_views, self.models):
+            
+        #    us.append(get_uncertainty(view, model, batch_size=256, verbose=True))
+
+        return torch.stack(preds), us, labels
 
     def update(self,
                preds_softmax: torch.Tensor,
@@ -575,6 +637,7 @@ class CoTrainingModel:
             loaders_test[i]._iterator._shutdown_workers()
 
             iteration_logs.append(model_logs)
+            self.models[i].module.update_covariance()
 
 
         self.logs += merge_wandb_logs(iteration, epochs, iteration_logs)
