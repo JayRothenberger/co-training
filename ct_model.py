@@ -241,10 +241,12 @@ def get_k(prediction, u, epsilon, frequencies):
                 idx[unq].append(i)
                 
     idx = [torch.tensor(inds) for inds in idx]
-    print(torch.tensor([inds.shape[0] for inds in idx]))
     # stratified balance
     ratios = (frequencies / frequencies.sum())
     # normalize by the balance
+    print(frequencies)
+    print(ratios)
+    print(torch.tensor([inds.shape[0] for inds in idx]))
     k = int((torch.tensor([inds.shape[0] for inds in idx]) / ratios).min())
     print('k', k)
     return k
@@ -320,12 +322,11 @@ class CoTrainingModel:
         samplers_unlbl = []
         loaders_unlbl = []
         for i in range(len(unlbl_views)):
-            sampler_unlbl, loader_unlbl = create_sampler_loader(self.rank, 
-                                                                self.world_size,
-                                                                unlbl_views[i],
-                                                                batch_size,
-                                                                shuffle=False)
-            samplers_unlbl.append(sampler_unlbl)
+            loader_unlbl = create_loader(self.rank, 
+                                        self.world_size,
+                                        unlbl_views[i],
+                                        batch_size,
+                                        shuffle=False)
             loaders_unlbl.append(loader_unlbl)
 
         us = []
@@ -333,13 +334,23 @@ class CoTrainingModel:
         labels = []
 
         for model, loader in zip(self.models, loaders_unlbl):
-            preds_softmax, labels, uncs = predict_ddp(int(os.environ['WORLD_SIZE']),
-                                                            device, 
-                                                            model, 
-                                                            loader, 
-                                                            batch_size, 
-                                                            num_classes, 
-                                                            with_variance=True)
+            uncs = []
+            pred = []
+            labs = []
+
+            with torch.no_grad():
+                for X, y in loader:
+                    output, variance = model(X.to(device), with_variance=True)
+                    uncs.append(variance)
+                    pred.append(output)
+                    labs.append(y)
+
+            uncs = torch.cat(uncs)
+            pred = torch.cat(pred)
+            dist.broadcast(uncs, 0)
+            dist.broadcast(pred, 0)
+            labels = torch.cat(labs)
+
             uncs.type(torch.float32)
 
             #std = torch.std(uncs)
@@ -349,20 +360,20 @@ class CoTrainingModel:
             
             # lean 6 sigma - we can clearly clamp out these outliers
             #uncs = torch.clamp(uncs, max((mean - math.e*std), minval), (mean +  math.e*2*std))
-            uncs = remove_gaps(uncs, 5)
+            # uncs = remove_gaps(uncs, 0)
             uncs = uncs - uncs.min()
             uncs = torch.nn.ReLU()(uncs)
             print(uncs.min(), uncs.max())
-            uncs = (uncs / uncs.max()) ** (1 / math.e)
+            uncs = (uncs / uncs.max()) ** 0.5
             print(uncs.shape)
             us.append(uncs)
-            preds.append(preds_softmax)
+            preds.append(torch.nn.Softmax(-1)(pred))
             
         #for view, model in zip(unlbl_views, self.models):
             
         #    us.append(get_uncertainty(view, model, batch_size=256, verbose=True))
 
-        return torch.stack(preds), us, labels
+        return torch.stack(preds)[:,:len(unlbl_views[0])], us[:len(unlbl_views[0])], labels[:len(unlbl_views[0])]
 
     def update(self,
                preds_softmax: torch.Tensor,

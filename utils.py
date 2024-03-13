@@ -1,6 +1,7 @@
 import random
 from math import ceil, floor
 from typing import Literal
+from copy import deepcopy as copy
 
 import numpy as np
 import torch
@@ -11,6 +12,9 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torchvision import datasets, transforms
+
+from torch import vmap
+from torch.func import stack_module_state, functional_call
 
 from visualization import *
 
@@ -562,6 +566,148 @@ class EDLLossMSE:
         self.annealing_step *= 1.01
 
 
+def dino_model():
+    os.environ['TORCH_HOME'] = './'
+    os.environ['TORCH_HUB'] = './'
+    # DINOv2 vit-s (14) with registers
+    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg')
+    # state = model.state_dict()
+    # mymodel = vit_small(14, 4)
+    # mymodel.load_state_dict(state)
+    model.eval()
+
+    return model.to('cpu')
+
+
+
+def get_uncertainty(ds, model, batch_size=1024, verbose=True):
+    dataloader = DataLoader(ds, batch_size=batch_size)
+    uncs = []
+
+    for (X, y) in tqdm(dataloader, total=len(dataloader), disable=not verbose):
+        with torch.no_grad():
+            _, unc = model(X, with_variance=True)
+        uncs.append(unc.cpu())
+
+    uncs = torch.concat(uncs)
+    uncs = (uncs - uncs.min())
+    uncs = (uncs / uncs.max()) ** 0.5
+    return uncs.detach().cpu()
+
+
+def dino_RFGP(num_classes=3):
+    m = torch.nn.Sequential(dino_model(), torch.nn.BatchNorm1d(384)) # linear = torch.nn.Linear(384, num_classes)
+    
+    linear = RandomFeatureGaussianProcess(
+                    in_features=384,
+                    out_features=num_classes,
+                    backbone=m,
+                    n_inducing=1024,
+                    momentum = 0.9,
+                    ridge_penalty = 1e-6,
+                    activation = Cos(),
+                    verbose = False,
+                )
+    
+    return linear
+
+
+def remove_gaps(arr, remove=1):
+    # remove the largest gap between numerical values in a 1-d array towards the heavier side
+    s, _ = torch.sort(arr, 0)
+    s -= s.min()
+    a1 = torch.cat((s, torch.zeros(1,).to(s.get_device())))
+    a2 = torch.cat((torch.zeros(1,).to(s.get_device()), s))
+    # each coordinate represents the distance between this coordinate and the next
+    gaps = torch.abs((a1 - a2)[1:-1])
+    order = torch.argsort(torch.abs(gaps), descending=True)
+
+    for i in range(remove):
+        coord = order[i]
+        offset = gaps[coord]
+        if coord > a1.shape[0] // 2:
+            arr -= torch.where(arr > s[coord], offset, 0.0)
+        else:
+            arr += torch.where(arr < s[coord], offset, 0.0)
+
+    return arr
+
+
+class LinearProbe(torch.nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.m = dino_model()
+        self.linear = torch.nn.Linear(384, num_classes)
+    
+    def forward(self, x):
+        x = self.m(x).detach()
+        return self.linear(x)
+
+class dino_MLP(torch.nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.m = dino_model()
+        self.linear = torch.nn.Linear(384, 384)
+        self.logits = torch.nn.Linear(384, num_classes)
+    
+    def forward(self, x):
+        x = self.m(x).detach()
+        x = self.linear(x).relu()
+        x = self.logits(x)
+        return x
+
+
+class stacked_dino_ENS(torch.nn.Module):
+    def __init__(self, n_classes):
+        super().__init__()
+        rank = int(os.environ['RANK'])
+        device = rank % torch.cuda.device_count()
+
+        self.mod_list = torch.nn.ModuleList([dino_MLP(num_classes=n_classes) for i in range(25)])
+        self.params, self.buffers = stack_module_state(self.mod_list)
+        self.base_model = copy(self.mod_list[0])
+
+        def fmodel(params, buffers, x):
+            return functional_call(self.base_model, (params, buffers), (x,))
+        
+        self.vector_predict = vmap(fmodel, in_dims=(0, 0, None))
+
+    def update_covariance(self):
+        pass
+
+    def forward(self, x, with_variance=False, **kwargs):
+
+        predictions = self.vector_predict(self.params, self.buffers, x)
+
+        if with_variance:
+            pred = torch.sum(predictions, 0) / len(self.mod_list)
+            pred_idx = torch.argmax(pred, -1)
+            smax = torch.nn.functional.softmax(predictions, -1)
+            unc = torch.gather(torch.var(smax, 0), -1, pred_idx.unsqueeze(-1)).squeeze()
+            return pred, unc
+        else:
+            return torch.sum(predictions, 0) / len(self.mod_list)
+
+
+class dino_ENS(torch.nn.Module):
+    def __init__(self, num_classes):
+        super().__init__()
+        self.mod_list = torch.nn.ModuleList([dino_MLP(num_classes=num_classes) for i in range(25)])
+    
+    def update_covariance(self):
+        pass
+
+    def forward(self, x, with_variance=False, **kwargs):
+
+        if with_variance:
+            pred = sum([mod(x) for mod in self.mod_list]) / len(self.mod_list)
+            pred_idx = torch.argmax(pred, -1)
+            unc = torch.gather(torch.var(torch.stack([torch.nn.functional.softmax(mod(x), -1) for mod in self.mod_list]), 0), -1, pred_idx.unsqueeze(-1)).squeeze()
+            return pred, unc
+        else:
+            return sum([mod(x) for mod in self.mod_list]) / len(self.mod_list)
+
+# adapted from https://github.com/alartum/sngp-pytorch with minor fixes by Jay Rothenbeger
 import math
 from collections import OrderedDict
 import os
@@ -572,7 +718,7 @@ from torch.nn.parameter import Parameter
 
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
-
+from torch.nn.utils import spectral_norm
 
 class Cos(nn.Module):
     def __init__(self):
@@ -650,6 +796,7 @@ class RandomFeatureGaussianProcess(nn.Module):
         with_variance: bool = False,
         update_precision: bool = False,
     ):
+    
         features = self.rff(X).detach()
 
         if update_precision:
@@ -665,10 +812,9 @@ class RandomFeatureGaussianProcess(nn.Module):
                     "`with_variance` to True"
                 )
             with torch.no_grad():
-                variances = torch.bmm(
-                    features[:, None, :],
-                    (features @ self.covariance)[:, :, None],
-                ).reshape(-1)
+                features = features.mean(1)
+                # x^T \Sigma x
+                variances = (features[:, None, :] @ self.covariance[None, :, :] @ features[:, :, None]).reshape(-1)
 
             return logits, variances
 
@@ -676,6 +822,8 @@ class RandomFeatureGaussianProcess(nn.Module):
         self.precision[...] = self.precision_initial.detach()
 
     def update_precision_(self, features: torch.Tensor):
+        features = torch.flatten(features, 0, -2)
+        print(features.shape, self.precision.shape)
         with torch.no_grad():
             if self.momentum < 0:
                 # Use this to compute the precision matrix for the whole
@@ -709,20 +857,6 @@ class RandomFeatureGaussianProcess(nn.Module):
         self.covariance.zero_()
 
 
-def dino_model():
-    os.environ['TORCH_HOME'] = './'
-    os.environ['TORCH_HUB'] = './'
-    # DINOv2 vit-s (14) with registers
-    model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14_reg')
-    # state = model.state_dict()
-    # mymodel = vit_small(14, 4)
-    # mymodel.load_state_dict(state)
-    model.eval()
-
-    return model.to('cpu')
-
-
-
 def get_uncertainty(ds, model, batch_size=1024, verbose=True):
     dataloader = DataLoader(ds, batch_size=batch_size)
     uncs = []
@@ -738,49 +872,68 @@ def get_uncertainty(ds, model, batch_size=1024, verbose=True):
     return uncs.detach().cpu()
 
 
-def dino_RFGP(num_classes=3):
-    m = torch.nn.Sequential(dino_model(), torch.nn.BatchNorm1d(384)) # linear = torch.nn.Linear(384, num_classes)
-    
-    linear = RandomFeatureGaussianProcess(
-                    in_features=384,
-                    out_features=num_classes,
-                    backbone=m,
-                    n_inducing=1024,
-                    momentum = 0.9,
-                    ridge_penalty = 1e-6,
-                    activation = Cos(),
-                    verbose = False,
-                )
-    
-    return linear
+def patches_to_image(x, patch_size=14):
+    # x shape is batch_size x num_patches x c
+    batch_size, num_patches, c = x.size()
+    grid_size = int(num_patches ** 0.5)
+
+    out_channels = c // (patch_size ** 2)
+
+    x_image = x.view(batch_size, grid_size, grid_size, c)
+
+    output_h = grid_size * patch_size
+    output_w = grid_size * patch_size
+
+    x_image = x_image.permute(0, 3, 1, 2).contiguous()
+
+    x_image = x_image.view(batch_size, out_channels, output_h, output_w)
+    return x_image
 
 
-def remove_gaps(arr, remove=1):
-    # remove the largest gap between numerical values in a 1-d array towards the heavier side
-    s, _ = torch.sort(arr)
-    a1 = torch.cat(s, torch.zeros(1,))
-    a2 = torch.cat(torch.zeros(1,), s)
-    # each coordinate represents the distance between this coordinate and the next
-    gaps = (a2 - a1)[1:-1]
-    order = torch.argsort(gaps, descending=True)
+def SN_wrapper(layer, use_sn):
+    if use_sn:
+        return spectral_norm(layer)
+    else:
+        return layer
 
-    for i in range(remove):
-        coord = order[i]
-        offset = gaps[coord]
-        if coord > a1.shape[0] // 2:
-            arr -= torch.where(arr > s[coord]).type(torch.float32) * offset
-        else:
-            arr += torch.where(arr < s[coord]).type(torch.float32) * offset
+class Identity_module(nn.Module):
+    def __init__(self):
+        super(Identity_module, self).__init__()
 
-    return arr
-
-
-class LinearProbe(torch.nn.Module):
-    def __init__(self, num_classes):
-        super().__init__()
-        self.m = dino_model()
-        self.linear = torch.nn.Linear(384, num_classes)
-    
     def forward(self, x):
-        x = self.m(x).detach()
-        return self.linear(x)
+        return x
+
+class SNGP_probe(nn.Module):
+    def __init__(self, backbone, backbone_features, num_classes=3, embed_features=384):
+        super(SNGP_probe, self).__init__()
+        self.backbone = backbone
+        # self.linear = SN_wrapper(torch.nn.Linear(backbone_features, embed_features), True)
+        self.logits = RandomFeatureGaussianProcess(
+                                                    in_features=backbone_features,
+                                                    out_features=num_classes,
+                                                    backbone=Identity_module(),
+                                                    n_inducing=1024,
+                                                    momentum = 0.9,
+                                                    ridge_penalty = 1e-6,
+                                                    activation = Cos(),
+                                                    verbose = False,
+                                                )
+
+    def update_covariance(self):
+        self.logits.update_covariance()
+
+    def forward(self, x, update_precision=False, with_variance=False):
+        with torch.no_grad():
+            x = self.backbone(x).detach()
+        # x = self.linear(x)
+        if with_variance:
+            x, var = self.logits(x, update_precision=update_precision, with_variance=with_variance)
+            x = x.mean(1)
+
+            return x, var
+        else:
+            x = self.logits(x, update_precision=update_precision, with_variance=with_variance)
+            x = x.mean(1)
+
+            return x
+            

@@ -9,7 +9,9 @@ from math import floor
 import time
 from PIL import Image, ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
-
+from pretrained_ijepa import load_checkpoint, init_model
+import yaml
+from yaml import Loader
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -36,6 +38,30 @@ from utils import *
 
 import albumentations as A
 
+def load_pretrained_model(yaml_path, checkpoint_path, device):
+    with open(yaml_path, 'rb') as fp:
+        yam = yaml.load(fp, Loader)
+
+    encoder, predictor = init_model(
+            device=device,
+            patch_size=yam['mask']['patch_size'],
+            crop_size=yam['data']['crop_size'],
+            pred_depth=yam['meta']['pred_depth'],
+            pred_emb_dim=yam['meta']['pred_emb_dim'],
+            model_name=yam['meta']['model_name']
+            )
+
+    target_encoder = copy(encoder)
+
+    encoder, predictor, target_encoder, epoch = load_checkpoint(device,
+                                                                checkpoint_path,
+                                                                encoder,
+                                                                predictor,
+                                                                target_encoder,
+                                                                )
+    
+    return target_encoder
+
 Atransforms = A.Compose([      
     A.augmentations.geometric.rotate.Rotate(limit=15,p=0.5),
     A.Perspective(scale=[0,0.1],keep_size=False,fit_output=False,p=1),
@@ -55,7 +81,11 @@ def create_model(auto_wrap_policy, device, num_classes, random_state=None):
     if random_state is not None:
         torch.manual_seed(random_state)
 
-    model = dino_RFGP(num_classes=num_classes).to(device)
+    #target_encoder = load_pretrained_model('./in1k_vith14_ep300.yaml', '../models/IN22K-vit.h.14-900e.pth.tar', 0)
+    #model = SNGP_probe(target_encoder, 1280, num_classes, embed_features=384).to(device)
+
+    # model = dino_RFGP(num_classes=num_classes).to(device)
+    model = stacked_dino_ENS(num_classes=num_classes).to(device)
     
     model = DDP(model, device_ids=[device], find_unused_parameters=True)
 
@@ -202,9 +232,9 @@ def training_process(args, rank, world_size):
     ct_model.frequencies = counts
 
     if rank == 0:
-       wandb.init(project='co-training-sngp',
+       wandb.init(project='co-training-deep-ens',
                    entity='ai2es',
-                   name=f'Co-Training',
+                   name=f'Co-Training DINO ens',
                    config={'args': vars(args)})
 
     if rank == 0:
@@ -268,7 +298,7 @@ def training_process(args, rank, world_size):
         best_val_acc = max(best_val_acc, best_val_acc_i)
         best_val_loss = min(best_val_loss, best_val_loss_i)
 
-        ct_model.epsilon = 1 - max(ct_model.frequencies / ct_model.frequencies.sum()) #  + (1 / args.cotrain_iters)
+        ct_model.epsilon = 0.05
 
         print('epsilon', ct_model.epsilon)
 
@@ -377,7 +407,7 @@ def create_parser():
                         help='training epochs (default: %(default)s)')
     parser.add_argument('-b', '--batch_size', type=int, default=256, 
                         help='batch size for training (default: %(default)s)')
-    parser.add_argument('-tb', '--test_batch_size', type=int, default=32, 
+    parser.add_argument('-tb', '--test_batch_size', type=int, default=128, 
                         help=' batch size for testing (default: %(default)s)')
     parser.add_argument('-lr', '--learning_rate', type=float, default=1e-3,
                         help='learning rate for SGD (default: %(default)s)')
@@ -392,17 +422,17 @@ def create_parser():
     parser.add_argument('--k', type=float, default=[0.01],
                         help='percentage of unlabeled samples to bring in each \
                             co-training iteration (default: 0.025)')
-    parser.add_argument('--percent_unlabeled', type=float, default=[0.75, 0.8, 0.85, 0.9, 0.95] * 3,
+    parser.add_argument('--percent_unlabeled', type=float, default=[0.9, 0.95, 0.9, 0.95] * 3,
                         help='percentage of unlabeled samples to start with (default: 0.9')
     parser.add_argument('--percent_test', type=float, default=0.2,
                         help='percentage of samples to use for testing (default: %(default)s)')
-    parser.add_argument('--percent_val', type=float, default=0.2,
+    parser.add_argument('--percent_val', type=float, default=0.75,
                         help='percentage of labeled samples to use for validation (default: %(default)s)')
     parser.add_argument('--stopping_metric', type=str, default='accuracy', choices=['loss', 'accuracy'],
                         help='metric to use for early stopping (default: %(default)s)')
     parser.add_argument('--from_scratch', action='store_true',
                         help='whether to train a new model every co-training iteration (default: False)')
-    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/jroth/co-training/co-training_fewer_sngp_2/',
+    parser.add_argument('--path', type=str, default='/ourdisk/hpc/ai2es/jroth/co-training/co-training_fewer_deep_ens/',
                         help='path for hparam search directory')
     parser.add_argument('--seed', type=int, default=13,
                         help='seed for random number generator (default: %(default)s)')
