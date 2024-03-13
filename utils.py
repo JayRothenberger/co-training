@@ -660,10 +660,11 @@ class dino_MLP(torch.nn.Module):
 class stacked_dino_ENS(torch.nn.Module):
     def __init__(self, n_classes):
         super().__init__()
+
         rank = int(os.environ['RANK'])
         device = rank % torch.cuda.device_count()
 
-        self.mod_list = torch.nn.ModuleList([dino_MLP(num_classes=n_classes) for i in range(25)])
+        self.mod_list = torch.nn.ModuleList([dino_MLP(num_classes=n_classes).to(device) for i in range(25)])
         self.params, self.buffers = stack_module_state(self.mod_list)
         self.base_model = copy(self.mod_list[0])
 
