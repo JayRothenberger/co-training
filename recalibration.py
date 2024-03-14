@@ -22,9 +22,13 @@ class ModelWithTemperature(nn.Module):
         self.model = model
         self.temperature = nn.Parameter(torch.ones(1) * 1.5)
 
-    def forward(self, input):
-        logits = self.model(input)
-        return self.temperature_scale(logits)
+    def forward(self, input, with_variance=False):
+        if with_variance:
+            logits, variance = self.model(input, with_variance)
+            return self.temperature_scale(logits), variance
+        else:
+            logits = self.model(input, with_variance)
+            return self.temperature_scale(logits)
 
     def temperature_scale(self, logits):
         """

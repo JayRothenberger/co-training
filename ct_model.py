@@ -578,7 +578,10 @@ class CoTrainingModel:
 
         if lr_scheduler is not None:
             for i, opt in enumerate(optimizers):
-                schedulers.append(lr_scheduler(opt)) 
+                schedulers.append(lr_scheduler(opt))
+        else:
+            for i, opt in enumerate(optimizers):
+                schedulers.append(ReduceLROnPlateau(opt, 'max', factor=0.5, patience=10))
 
         samplers_train, loaders_train = create_samplers_loaders(self.rank, self.world_size,
                                                                 train_views, batch_size, 
@@ -618,11 +621,13 @@ class CoTrainingModel:
                                                loaders_test[i], loss_fn)
 
                 stoppers[i].step(val_acc, val_loss)
-                if stoppers[i].epochs_since_improvement == 0:
+                if stoppers[i].epochs_since_improvement == 0 and (stoppers[i].best_val_acc > states[f'model{i}_best_acc']):
                     states[f'model{i}_state'] = copy(self.models[i].state_dict())
                     states[f'optimizer{i}_state'] = optimizers[i].state_dict()
                     best_val_acc = max(best_val_acc, stoppers[i].best_val_acc)
                     best_val_loss = min(best_val_loss, stoppers[i].best_val_loss)
+                    states[f'model{i}_best_acc'] = max(states[f'model{i}_best_acc'], stoppers[i].best_val_acc)
+                    states[f'model{i}_best_loss'] = min(states[f'model{i}_best_loss'], stoppers[i].best_val_loss)
                     print('best val acc', best_val_acc)
                 
                 model_logs.append({f'train_acc{i}': train_acc,

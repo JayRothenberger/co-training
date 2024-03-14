@@ -185,7 +185,7 @@ def training_process(args, rank, world_size):
 
     # ResNet50 wants 224x224 images
 
-    trans = transforms.Compose([
+    trans_train = transforms.Compose([
         transforms.Resize(256),
         transforms.CenterCrop(224),
         Atransforms_fn,
@@ -194,22 +194,32 @@ def training_process(args, rank, world_size):
                          std=[0.229, 0.224, 0.225])
     ])
 
+    trans = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], 
+                         std=[0.229, 0.224, 0.225])
+    ])
+
     # Create ImageFolder objects for first view
     dummy_path = '/ourdisk/hpc/ai2es/jroth/data/labeled' 
-    data_train0 = create_imagefolder(data, samples_train[0], dummy_path, trans)
+    data_train0 = create_imagefolder(data, samples_train[0], dummy_path, trans_train)
     data_unlbl0 = create_imagefolder(data, samples_unlbl[0], dummy_path, trans)
     data_val0 = create_imagefolder(data, samples_val[0], dummy_path, trans)
     data_test0 = create_imagefolder(data, samples_test[0], dummy_path, trans)
 
     # Create ImageFolder objects for second view (we will also update the root/path)
     new_path = '/ourdisk/hpc/ai2es'
-    data_train1 = create_imagefolder(data, samples_train[1], dummy_path, trans, new_path)
+    data_train1 = create_imagefolder(data, samples_train[1], dummy_path, trans_train, new_path)
     data_unlbl1 = create_imagefolder(data, samples_unlbl[1], dummy_path, trans, new_path)
     data_val1 = create_imagefolder(data, samples_val[1], dummy_path, trans, new_path)
     data_test1 = create_imagefolder(data, samples_test[1], dummy_path, trans, new_path)
 
     train_views = [data_train0, data_train1]
+    copy_train_views = copy(train_views)
     unlbl_views = [data_unlbl0, data_unlbl1]
+    copy_unlbl_views = copy(unlbl_views)
     val_views =  [data_val0, data_val1]
     test_views = [data_test0, data_test1]
 
@@ -226,7 +236,11 @@ def training_process(args, rank, world_size):
                 for _ in range(num_views)]
 
     states = {'model0_state': models[0].state_dict(),
-              'model1_state': models[1].state_dict()}
+              'model1_state': models[1].state_dict(),
+              'model0_best_acc': 0.0,
+              'model0_best_loss': float('inf'),
+              'model1_best_acc': 0.0,
+              'model1_best_loss': float('inf')}
 
     ct_model = CoTrainingModel(rank, world_size, models)
     ct_model.frequencies = counts
@@ -273,7 +287,7 @@ def training_process(args, rank, world_size):
         if rank == 0:
             print(f"co-training iteration: {c_iter}")
             print("train: {} unlabeled: {}"
-                  .format(len(data_train0), len(data_unlbl0)))
+                  .format(len(train_views[0]), len(unlbl_views[0])))
 
         train_kwargs = {'device': device,
                         'iteration': c_iter,
@@ -283,7 +297,7 @@ def training_process(args, rank, world_size):
                         'val_views': val_views,
                         'test_views': test_views,
                         'batch_size': args.batch_size,
-                        'test_batch_size': args.test_batch_size}
+                        'test_batch_size': args.test_batch_size,}
         
         opt_kwargs = {'lr': args.learning_rate}
         
@@ -298,14 +312,14 @@ def training_process(args, rank, world_size):
         best_val_acc = max(best_val_acc, best_val_acc_i)
         best_val_loss = min(best_val_loss, best_val_loss_i)
 
-        ct_model.epsilon = 0.05
+        ct_model.epsilon = 0.075
 
         print('epsilon', ct_model.epsilon)
 
         print('best val acc:', best_val_acc)
 
         # load best states for this iteration
-        for i, model in enumerate(models):
+        for i, model in enumerate(ct_model.models):
             model.load_state_dict(states[f'model{i}_state'])
 
         print(len(data_val0), len(data_val1))
@@ -319,36 +333,20 @@ def training_process(args, rank, world_size):
         c_acc_val = c_test(rank, models[0], models[1], loader_val0, loader_val1, device)
         c_acc_test = c_test(rank, models[0], models[1], loader_test0, loader_test1, device)
 
+
+        # TODO clean this a bit
+        ct_model.models[0] = recalibration.ModelWithTemperature(models[0])
+        ct_model.models[0].set_temperature(world_size, device, loader_val0, args.test_batch_size, num_classes)
+
+        ct_model.models[1] = recalibration.ModelWithTemperature(models[1])
+        ct_model.models[1].set_temperature(world_size, device, loader_val1, args.test_batch_size, num_classes)
+        
         # prediction
         preds_softmax, u, labels = ct_model.predict_uncertainty(device, unlbl_views, num_classes, args.batch_size)
 
-        if rank == 0:
-            print("checking model calibration...")
-
-        # calibration measurements
-        calibration_logs = {}
-        for i, preds in enumerate(preds_softmax):
-            preds_np = preds.detach().cpu().numpy()
-            lbls_np = labels.detach().cpu().numpy().astype(int)
-            ece_loss = ece_criterion.loss(preds_np, lbls_np, logits=False)
-            ace_loss = ace_criterion.loss(preds_np, lbls_np, logits=False)
-            mace_loss = mace_criterion.loss(preds_np, lbls_np, logits=False)
-            calibration_logs.update({f'ece_loss{i}': ece_loss,
-                                     f'ace_loss{i}': ace_loss,
-                                     f'mace_loss{i}': mace_loss})
-            print({f'ece_loss{i}': ece_loss,
-                                     f'ace_loss{i}': ace_loss,
-                                     f'mace_loss{i}': mace_loss})
-        if rank == 0:
-            print("calibrating models...")
-
-        # TODO clean this a bit
-        #models[0] = recalibration.ModelWithTemperature(models[0])
-        #models[0].set_temperature(world_size, device, loader_val0, args.test_batch_size, num_classes)
-
-        #models[1] = recalibration.ModelWithTemperature(models[1])
-        #models[1].set_temperature(world_size, device, loader_val1, args.test_batch_size, num_classes)
-
+        # reset the datasets
+        train_views = copy(copy_train_views)
+        unlbl_views = copy(copy_unlbl_views)
         # update datasets
         ct_model.update(preds_softmax, u, train_views, unlbl_views, k)
 
@@ -356,8 +354,8 @@ def training_process(args, rank, world_size):
             print("testing after dataset update and calibration...")
 
         # test individual models after co-training update and calibration
-        test_acc0, test_loss0 = test_ddp(rank, device, models[0], loader_test0, loss_fn)
-        test_acc1, test_loss1 = test_ddp(rank, device, models[1], loader_test1, loss_fn)
+        test_acc0, test_loss0 = test_ddp(rank, device, ct_model.models[0], loader_test0, loss_fn)
+        test_acc1, test_loss1 = test_ddp(rank, device, ct_model.models[1], loader_test1, loss_fn)
 
         c_log = {'test_acc0': test_acc0,
                  'test_loss0': test_loss0,
@@ -367,7 +365,7 @@ def training_process(args, rank, world_size):
                  'c_acc_test': c_acc_test}
         
         c_iter_logs += ct_model.logs
-        c_iter_logs[-1] = ({**c_iter_logs[-1][0], **c_log, **calibration_logs}, c_iter_logs[-1][1])
+        c_iter_logs[-1] = ({**c_iter_logs[-1][0], **c_log}, c_iter_logs[-1][1])
         
     dist.barrier()
 

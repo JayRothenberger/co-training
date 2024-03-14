@@ -681,7 +681,7 @@ class stacked_dino_ENS(torch.nn.Module):
             pred = torch.sum(predictions, 0) / len(self.mod_list)
             pred_idx = torch.argmax(pred, -1)
             smax = torch.nn.functional.softmax(predictions, -1)
-            unc = torch.gather(torch.var(smax, 0), -1, pred_idx.unsqueeze(-1)).squeeze()
+            unc = torch.gather(torch.var(smax, 0), -1, pred_idx.unsqueeze(-1)).squeeze() - torch.gather(torch.mean(smax, 0), -1, pred_idx.unsqueeze(-1)).squeeze()
             return pred, unc
         else:
             return torch.sum(predictions, 0) / len(self.mod_list)
