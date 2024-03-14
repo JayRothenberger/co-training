@@ -85,7 +85,7 @@ def create_model(auto_wrap_policy, device, num_classes, random_state=None):
     #model = SNGP_probe(target_encoder, 1280, num_classes, embed_features=384).to(device)
 
     # model = dino_RFGP(num_classes=num_classes).to(device)
-    model = stacked_dino_ENS(num_classes=num_classes).to(device)
+    model = stacked_dino_ENS(num_classes).to(device)
     
     model = DDP(model, device_ids=[device], find_unused_parameters=True)
 
@@ -405,7 +405,7 @@ def create_parser():
     
     parser.add_argument('-e', '--epochs', type=int, default=512, 
                         help='training epochs (default: %(default)s)')
-    parser.add_argument('-b', '--batch_size', type=int, default=256, 
+    parser.add_argument('-b', '--batch_size', type=int, default=128, 
                         help='batch size for training (default: %(default)s)')
     parser.add_argument('-tb', '--test_batch_size', type=int, default=128, 
                         help=' batch size for testing (default: %(default)s)')

@@ -651,34 +651,31 @@ class dino_MLP(torch.nn.Module):
         self.logits = torch.nn.Linear(384, num_classes)
     
     def forward(self, x):
-        x = self.m(x).detach()
+        with torch.no_grad():
+            x = self.m(x).detach()
         x = self.linear(x).relu()
         x = self.logits(x)
         return x
 
 
 class stacked_dino_ENS(torch.nn.Module):
-    def __init__(self, n_classes):
+    def __init__(self, num_classes):
         super().__init__()
+        self.m = dino_model()
 
         rank = int(os.environ['RANK'])
         device = rank % torch.cuda.device_count()
 
-        self.mod_list = torch.nn.ModuleList([dino_MLP(num_classes=n_classes).to(device) for i in range(25)])
-        self.params, self.buffers = stack_module_state(self.mod_list)
-        self.base_model = copy(self.mod_list[0])
-
-        def fmodel(params, buffers, x):
-            return functional_call(self.base_model, (params, buffers), (x,))
-        
-        self.vector_predict = vmap(fmodel, in_dims=(0, 0, None))
+        self.mod_list = torch.nn.ModuleList([torch.nn.Sequential(torch.nn.Linear(384, 384), torch.nn.Linear(384, num_classes)).to(device) for i in range(25)])
 
     def update_covariance(self):
         pass
 
-    def forward(self, x, with_variance=False, **kwargs):
-
-        predictions = self.vector_predict(self.params, self.buffers, x)
+    def forward(self, x, with_variance=False, update_precision=False):
+        with torch.no_grad():
+            x = self.m(x).detach()
+        
+        predictions = torch.stack([mod(x) for mod in self.mod_list])
 
         if with_variance:
             pred = torch.sum(predictions, 0) / len(self.mod_list)
